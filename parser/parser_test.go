@@ -281,6 +281,7 @@ func (s *testParserSuite) RunTest(c *C, table []testCase) {
 			continue
 		}
 		c.Assert(err, IsNil, comment)
+		fmt.Println("修改了这行")
 	}
 }
 
