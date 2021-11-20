@@ -495,7 +495,67 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	groupByColumns := expression.NewSchema(agg.GetGroupByCols()...)
+	aggSchema := old.Children[0].Prop.Schema
+	// 对group by 涉及到的列下推
+	var pushedExprs []expression.Expression
+	var remainedExprs []expression.Expression
+
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			pushedExprs = append(pushedExprs, cond)
+			remainedExprs = append(remainedExprs, cond)
+		// https://github.com/dianchengwangCHN/tinysql/blob/95e9265b007616dabd60cc2892202f5d689c3427/parser/ast/functions.go#L30
+		// scalar function 根据一个值返回一个值的函数 
+		case *expression.ScalarFunction:
+			// 聚集的函数， 解出来用到的列， 如果 gourp by 的 列包含了  聚集的列
+			// 那么就可以下推
+			// 例如 max(a) group by a having a > 10 
+			// 可以下推成 max( a> 10)
+			extractedCols := expression.ExtractColumns(cond)
+			canPush := true 
+			for _, col := range extractedCols {
+				if !groupByColumns.Contains(col) {
+					canPush = false
+					break
+				}
+			}
+			if canPush {
+				pushedExprs = append(pushedExprs, cond)
+			} else {
+				remainedExprs = append(remainedExprs, cond)
+			}
+		default:
+			remainedExprs = append(remainedExprs, cond)
+		}
+	}
+	if len(pushedExprs) == 0 {
+		return nil, false, false, nil
+	}
+
+	// 拼凑 remain_select* -> aggr -> push_select
+	sctx := sel.SCtx()
+	childGroup := old.Children[0].GetExpr().Children[0]
+	pushedSel := plannercore.LogicalSelection{Conditions: pushedExprs}.Init(sctx)
+	pushedGroupExpr := memo.NewGroupExpr(pushedSel)
+	pushedGroupExpr.SetChildren(childGroup)
+	pushedGroup := memo.NewGroupWithSchema(pushedGroupExpr, childGroup.Prop.Schema)
+
+	aggGroupExpr := memo.NewGroupExpr(agg)
+	aggGroupExpr.SetChildren(pushedGroup)
+
+	if len(remainedExprs) == 0 {
+		return []*memo.GroupExpr{aggGroupExpr}, true, false, nil
+	}
+
+	aggGroup := memo.NewGroupWithSchema(aggGroupExpr, aggSchema)
+	remainedSel := plannercore.LogicalSelection{Conditions: remainedExprs}.Init(sctx)
+	remainedGroupExpr := memo.NewGroupExpr(remainedSel)
+	remainedGroupExpr.SetChildren(aggGroup)
+	return []*memo.GroupExpr{remainedGroupExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -798,5 +858,34 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	// TODO: implement the body according to the header comment.
+	oldAgg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	proj := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	projSchema := old.Children[0].GetExpr().Schema()
+
+	// 替换 gourp by 的 
+	groupByItems := make([]expression.Expression, len(oldAgg.GroupByItems))
+	for i, item := range oldAgg.GroupByItems {
+		groupByItems[i] = expression.ColumnSubstitute(item, projSchema, proj.Exprs)
+	}
+
+	// 替换选取
+	aggFuncs := make([]*aggregation.AggFuncDesc, len(oldAgg.AggFuncs))
+	for i, aggFunc := range oldAgg.AggFuncs {
+		aggFuncs[i] = aggFunc.Clone()
+		newArgs := make([]expression.Expression, len(aggFunc.Args))
+		for j, arg := range aggFunc.Args {
+			newArgs[j] = expression.ColumnSubstitute(arg, projSchema, proj.Exprs)
+		}
+		aggFuncs[i].Args = newArgs
+	}
+
+	newAgg := plannercore.LogicalAggregation{
+		GroupByItems: groupByItems,
+		AggFuncs:     aggFuncs,
+	}.Init(oldAgg.SCtx())
+
+	newAggExpr := memo.NewGroupExpr(newAgg)
+	newAggExpr.SetChildren(old.Children[0].GetExpr().Children...)
+	return []*memo.GroupExpr{newAggExpr}, true, false, nil
 }
